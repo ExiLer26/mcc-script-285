@@ -1,0 +1,663 @@
+import type { Express } from "express";
+import type { Server } from "http";
+import { storage } from "./storage";
+import { api } from "@shared/routes";
+import { z } from "zod";
+import session from "express-session";
+import { type Admin } from "@shared/schema";
+
+declare module 'express-session' {
+  interface SessionData {
+    adminId: number;
+  }
+}
+
+export async function registerRoutes(
+  httpServer: Server,
+  app: Express
+): Promise<Server> {
+
+  // Simple session setup for custom auth
+  app.use(session({
+    secret: 'xtream-secret-key',
+    resave: false,
+    saveUninitialized: false,
+    cookie: { secure: false } // Set to true in prod with HTTPS
+  }));
+
+  // Auth Middleware
+  const requireAuth = async (req: any, res: any, next: any) => {
+    if (!req.session.adminId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+    next();
+  };
+
+  // --- Xtream Codes Compatibility API ---
+  
+  // Helper to handle stream redirects/proxying
+  const handleStreamRequest = async (req: any, res: any, streamId: number) => {
+    const stream = await storage.getStream(streamId);
+    if (!stream || !stream.isActive) {
+      return res.status(404).send("Stream not found");
+    }
+    res.redirect(stream.sourceUrl);
+  };
+
+  // Support for /live/username/password/stream_id (without extension)
+  app.get("/live/:username/:password/:streamId", async (req: any, res: any) => {
+    const { username, password, streamId } = req.params;
+    const lines = await storage.getLines();
+    const line = lines.find(l => l.username === username && l.password === password);
+    
+    if (!line || !line.isEnabled) {
+      return res.status(401).send("Unauthorized");
+    }
+    
+    const stream = await storage.getStream(Number(streamId));
+    if (!stream || !stream.isActive) {
+      return res.status(404).send("Stream not found");
+    }
+
+    // Proxy the stream instead of redirecting to avoid CORS and player issues
+    try {
+      const response = await fetch(stream.sourceUrl);
+      if (!response.ok) throw new Error("Source failed");
+      
+      const contentType = stream.sourceUrl.includes(".m3u8") 
+        ? "application/vnd.apple.mpegurl" 
+        : (response.headers.get("content-type") || "video/mp2t");
+      
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      
+      // Use pipe for efficient streaming
+      if (response.body) {
+        // @ts-ignore - ReadableStream to Writable
+        const reader = response.body.getReader();
+        const pump = async () => {
+          const { done, value } = await reader.read();
+          if (done) {
+            res.end();
+            return;
+          }
+          res.write(value);
+          await pump();
+        };
+        await pump();
+      } else {
+        res.status(500).send("No stream body");
+      }
+    } catch (error) {
+      // Fallback to redirect if proxy fails
+      res.redirect(302, stream.sourceUrl);
+    }
+  });
+
+  // Support for /live/username/password/stream_id.ts or .m3u8
+  app.get("/live/:username/:password/:streamId.:ext", async (req, res) => {
+    const { username, password, streamId, ext } = req.params;
+    const lines = await storage.getLines();
+    const line = lines.find(l => l.username === username && l.password === password);
+    
+    if (!line || !line.isEnabled) {
+      return res.status(401).send("Unauthorized");
+    }
+    
+    const stream = await storage.getStream(Number(streamId));
+    if (!stream || !stream.isActive) {
+      return res.status(404).send("Stream not found");
+    }
+
+    // Proxy the stream
+    try {
+      const response = await fetch(stream.sourceUrl);
+      if (!response.ok) throw new Error("Source failed");
+      
+      const contentType = (ext === "m3u8" || stream.sourceUrl.includes(".m3u8"))
+        ? "application/vnd.apple.mpegurl" 
+        : (response.headers.get("content-type") || "video/mp2t");
+      
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Access-Control-Allow-Origin", "*");
+
+      if (response.body) {
+        // @ts-ignore
+        const reader = response.body.getReader();
+        const pump = async () => {
+          const { done, value } = await reader.read();
+          if (done) {
+            res.end();
+            return;
+          }
+          res.write(value);
+          await pump();
+        };
+        await pump();
+      } else {
+        res.status(500).send("No stream body");
+      }
+    } catch (error) {
+      res.redirect(302, stream.sourceUrl);
+    }
+  });
+
+  // Support for /movie/username/password/stream_id.mp4
+  app.get("/movie/:username/:password/:streamId.:ext", async (req, res) => {
+    const { username, password, streamId } = req.params;
+    const lines = await storage.getLines();
+    const line = lines.find(l => l.username === username && l.password === password);
+    
+    if (!line || !line.isEnabled) {
+      return res.status(401).send("Unauthorized");
+    }
+    
+    const stream = await storage.getStream(Number(streamId));
+    if (!stream || !stream.isActive) {
+      return res.status(404).send("Stream not found");
+    }
+    
+    res.redirect(302, stream.sourceUrl);
+  });
+
+  // Support for /series/username/password/stream_id.mp4 (for episodes)
+  app.get("/series/:username/:password/:streamId.:ext", async (req, res) => {
+    const { username, password, streamId } = req.params;
+    const lines = await storage.getLines();
+    const line = lines.find(l => l.username === username && l.password === password);
+    
+    if (!line || !line.isEnabled) {
+      return res.status(401).send("Unauthorized");
+    }
+    
+    const stream = await storage.getStream(Number(streamId));
+    if (!stream || !stream.isActive) {
+      return res.status(404).send("Stream not found");
+    }
+    
+    res.redirect(302, stream.sourceUrl);
+  });
+
+  app.get("/player_api.php", async (req, res) => {
+    const { username, password, action } = req.query;
+
+    if (!username || !password) {
+      return res.status(401).json({ message: "Missing credentials" });
+    }
+
+    const lines = await storage.getLines();
+    const line = lines.find(l => l.username === username && l.password === password);
+
+    if (!line || !line.isEnabled) {
+      return res.status(401).json({ 
+        user_info: { auth: 0, status: "Active", exp_date: "0", message: "Invalid credentials" } 
+      });
+    }
+
+    if (!action) {
+      return res.json({
+        user_info: {
+          username: line.username,
+          password: line.password,
+          auth: 1,
+          status: "Active",
+          exp_date: line.expireDate ? Math.floor(line.expireDate.getTime() / 1000).toString() : "0",
+          is_trial: "0",
+          active_cons: "0",
+          max_connections: line.maxConnections?.toString() || "1",
+          revoked: "0",
+          created_at: Math.floor(line.createdAt!.getTime() / 1000).toString(),
+          message: ""
+        },
+        server_info: {
+          url: req.headers.host,
+          port: "80",
+          https_port: "443",
+          server_protocol: "http",
+          rtmp_port: "8000",
+          timezone: "UTC",
+          time_now: Math.floor(Date.now() / 1000).toString()
+        }
+      });
+    }
+
+    // Live Data
+    if (action === "get_live_categories") {
+      const cats = await storage.getCategories();
+      return res.json(cats.filter(c => c.type === 'live').map(c => ({
+        category_id: c.id.toString(),
+        category_name: c.name,
+        parent_id: "0"
+      })));
+    }
+
+    if (action === "get_live_streams") {
+      const allStreams = await storage.getStreams();
+      const categoryId = req.query.category_id;
+      let filtered = allStreams.filter(s => s.streamType === 'live');
+      if (categoryId && categoryId !== "0" && categoryId !== "") {
+        filtered = filtered.filter(s => s.categoryId === Number(categoryId));
+      }
+      return res.json(filtered.map(s => {
+        // Determine container extension based on source URL
+        const ext = s.sourceUrl.includes(".m3u8") ? "m3u8" : "ts" ;
+        return {
+          num: s.id,
+          name: s.name,
+          stream_type: "live",
+          stream_id: s.id,
+          stream_icon: s.iconUrl || "",
+          epg_channel_id: `channel.${s.id}`,
+          added: "1581930000",
+          category_id: s.categoryId?.toString() || "0",
+          custom_sid: "",
+          tv_archive: 0,
+          direct_source: s.sourceUrl,
+          tv_archive_duration: 0,
+          container_extension: ext
+        };
+      }));
+    }
+
+    // VOD Data (Movies)
+    if (action === "get_vod_categories") {
+      const cats = await storage.getCategories();
+      return res.json(cats.filter(c => c.type === 'movie').map(c => ({
+        category_id: c.id.toString(),
+        category_name: c.name,
+        parent_id: "0"
+      })));
+    }
+
+    if (action === "get_vod_streams") {
+      const allStreams = await storage.getStreams();
+      const categoryId = req.query.category_id;
+      let filtered = allStreams.filter(s => s.streamType === 'movie');
+      
+      if (categoryId && categoryId !== "0" && categoryId !== "") {
+        filtered = filtered.filter(s => s.categoryId === Number(categoryId));
+      }
+      
+      return res.json(filtered.map(s => ({
+        num: s.id,
+        name: s.name,
+        stream_type: "movie",
+        stream_id: s.id,
+        stream_icon: s.iconUrl || "",
+        rating: "5",
+        rating_5_point: 5,
+        added: "1581930000",
+        category_id: s.categoryId?.toString() || "0",
+        container_extension: "m3u",
+        custom_sid: "",
+        direct_source: s.sourceUrl
+      })));
+    }
+
+    if (action === "get_vod_info") {
+      const streamId = req.query.vod_id;
+      const stream = await storage.getStream(Number(streamId));
+      if (!stream) return res.status(404).json({ message: "Not found" });
+
+      return res.json({
+        info: {
+          name: stream.name,
+          movie_image: stream.iconUrl || "",
+          genre: "Action",
+          plot: "Test Movie Description",
+          cast: "Actor 1",
+          director: "Director 1",
+          releaseDate: "2024-01-01",
+          runtime: "120",
+          rating: "5"
+        },
+        movie_data: {
+          stream_id: stream.id,
+          name: stream.name,
+          container_extension: "m3u",
+          direct_source: stream.sourceUrl
+        }
+      });
+    }
+
+    // Series Data
+    if (action === "get_series_categories") {
+      const cats = await storage.getCategories();
+      return res.json(cats.filter(c => c.type === 'series' || c.type === 'serie').map(c => ({
+        category_id: c.id.toString(),
+        category_name: c.name,
+        parent_id: "0"
+      })));
+    }
+
+    if (action === "get_series") {
+      const allStreams = await storage.getStreams();
+      const categoryId = req.query.category_id;
+      let filtered = allStreams.filter(s => s.streamType === 'series' || s.streamType === 'serie');
+      
+      if (categoryId && categoryId !== "0" && categoryId !== "") {
+        filtered = filtered.filter(s => s.categoryId === Number(categoryId));
+      }
+
+      // Group episodes by their base name (e.g. "Anime Name" from "Anime Name E01")
+      const seriesMap = new Map();
+      filtered.forEach(s => {
+        // Improved base name extraction: removes season and episode markers
+        const baseName = s.name
+  .replace(/\s*S\d+E\d+.*$/i, "")
+  .replace(/\s*S\d+B\d+.*$/i, "")
+  .replace(/\s*\d+\.\s*Sezon.*$/i, "")
+  .replace(/\s*\d+\.\s*Bölüm.*$/i, "")
+  .replace(/\s*Bölüm\s*\d+.*$/i, "")
+  .trim();
+        
+        if (!seriesMap.has(baseName)) {
+          seriesMap.set(baseName, {
+            num: s.id,
+            name: baseName,
+            title: baseName,
+            series_id: s.id,
+            cover: s.iconUrl || "",
+            plot: s.notes,
+            cast: "",
+            director: "",
+            genre: "",
+            releaseDate: "",
+            last_modified: "1581930000",
+            rating: "5",
+            rating_5_point: 5,
+            category_id: s.categoryId?.toString() || "0"
+          });
+        }
+      });
+
+      return res.json(Array.from(seriesMap.values()));
+    }
+
+    if (action === "get_series_info") {
+      const seriesId = req.query.series_id;
+      const baseStream = await storage.getStream(Number(seriesId));
+      if (!baseStream) return res.status(404).json({ message: "Series not found" });
+
+      const getBaseName = (name: string) => {
+        return name
+  .replace(/\s*S\d+E\d+.*$/i, "")
+  .replace(/\s*S\d+B\d+.*$/i, "")
+  .replace(/\s*\d+\.\s*Sezon.*$/i, "")
+  .replace(/\s*\d+\.\s*Bölüm.*$/i, "")
+  .replace(/\s*Bölüm\s*\d+.*$/i, "")
+  .trim();
+      };
+
+      const baseName = getBaseName(baseStream.name);
+
+      // Find all episodes that belong to this series name
+      const allStreams = await storage.getStreams();
+      const episodes = allStreams
+        .filter(s => {
+          const sBase = getBaseName(s.name);
+          return sBase === baseName && (s.streamType === 'series' || s.streamType === 'serie');
+        })
+        .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+
+      // Group episodes by season
+      const seasonMap = new Map();
+      episodes.forEach(s => {
+        const seasonMatch = s.name.match(/\s*S(\d+)/i) || s.name.match(/\s*(\d+)\.\s*Sezon/i) || s.name.match(/\s(\d+)\.\s*Bölüm/i) || s.name.match(/\s*Bölüm\s*(\d+)/i);
+
+        const seasonNumber = seasonMatch ? parseInt(seasonMatch[1], 10) : 1;
+
+        if (!seasonMap.has(seasonNumber)) {
+          seasonMap.set(seasonNumber, []);
+        }
+
+        seasonMap.get(seasonNumber).push(s);
+      });
+
+      const sortedSeasons = Array.from(seasonMap.keys()).sort((a, b) => a - b);
+      const seasonsInfo = sortedSeasons.map(seasonNum => {
+        const seasonEpisodes = seasonMap.get(seasonNum);
+        return {
+          air_date: "2024-01-01",
+          episode_count: seasonEpisodes.length,
+          id: seasonNum,
+          name: `Sezon ${seasonNum}`,
+          overview: `Collection of ${seasonEpisodes.length} Episodes`,
+          season_number: seasonNum,
+          vote_average: 10
+        };
+      });
+
+      const episodesBySeason: Record<string, any[]> = {};
+      sortedSeasons.forEach(seasonNum => {
+        const seasonEpisodes = seasonMap.get(seasonNum);
+        episodesBySeason[seasonNum.toString()] = seasonEpisodes.map((s, index) => ({
+          id: s.id,
+          episode_num: index + 1,
+          episode_name: s.name,
+          title: s.name,
+          container_extension: "mp4",
+          info: {
+            movie_image: s.iconUrl || "",
+            plot: s.notes,
+            rating: "5"
+          },
+          custom_sid: "",
+          added: "1581930000",
+          season: seasonNum,
+          direct_source: s.sourceUrl
+        }));
+      });
+
+      return res.json({
+        seasons: seasonsInfo,
+        info: {
+          name: baseName,
+          cover: baseStream.iconUrl || "",
+          plot: baseStream.notes || `Auto-grouped series: ${baseName}`,
+          cast: "Various",
+          director: "Various",
+          genre: "Anime/Series",
+          releaseDate: "2024-01-01",
+          rating: "5",
+          last_modified: "1581930000"
+        },
+        episodes: episodesBySeason
+      });
+    }
+
+    return res.json({});
+  });
+
+  // XMLTV EPG Support
+  app.get("/xmltv.php", async (req, res) => {
+    const allStreams = await storage.getStreams();
+    const liveStreams = allStreams.filter(s => s.streamType === 'live');
+    
+    let xml = `<?xml version="1.0" encoding="UTF-8"?>\n`;
+    xml += `<!DOCTYPE tv SYSTEM "xmltv.dtd">\n`;
+    xml += `<tv generator-info-name="Xtream Codes" generator-info-url="http://replit.com">\n`;
+    
+    liveStreams.forEach(s => {
+      xml += `  <channel id="channel.${s.id}">\n`;
+      xml += `    <display-name lang="en">${s.name}</display-name>\n`;
+      xml += `    <icon src="${s.iconUrl || ''}" />\n`;
+      xml += `  </channel>\n`;
+    });
+    
+    xml += `</tv>`;
+    
+    res.set("Content-Type", "text/xml");
+    res.send(xml);
+  });
+
+  // --- Auth Routes ---
+  app.post(api.auth.login.path, async (req, res) => {
+    const { username, password } = req.body;
+    const admin = await storage.getAdminByUsername(username);
+
+    if (!admin || admin.password !== password) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    req.session.adminId = admin.id;
+    res.json(admin);
+  });
+
+  app.post(api.auth.logout.path, (req, res) => {
+    req.session.destroy(() => {
+      res.json({ message: "Logged out" });
+    });
+  });
+
+  app.get(api.auth.me.path, async (req, res) => {
+    if (!req.session.adminId) {
+      return res.status(401).json({ message: "Not authenticated" });
+    }
+    const admin = await storage.getAdmin(req.session.adminId);
+    if (!admin) {
+      return res.status(401).json({ message: "User not found" });
+    }
+    res.json(admin);
+  });
+
+  // --- Protected Routes ---
+  app.get(api.stats.get.path, requireAuth, async (req, res) => {
+    const stats = await storage.getStats();
+    res.json(stats);
+  });
+
+  app.get(api.categories.list.path, requireAuth, async (req, res) => {
+    const categories = await storage.getCategories();
+    res.json(categories);
+  });
+
+  app.post(api.categories.create.path, requireAuth, async (req, res) => {
+    const input = api.categories.create.input.parse(req.body);
+    const category = await storage.createCategory(input);
+    res.status(201).json(category);
+  });
+
+  app.delete(api.categories.delete.path, requireAuth, async (req, res) => {
+    await storage.deleteCategory(Number(req.params.id));
+    res.status(204).send();
+  });
+
+  app.get(api.streams.list.path, requireAuth, async (req, res) => {
+    const streams = await storage.getStreams();
+    res.json(streams);
+  });
+
+  app.post(api.streams.create.path, requireAuth, async (req, res) => {
+    const input = api.streams.create.input.parse(req.body);
+    const stream = await storage.createStream(input);
+    res.status(201).json(stream);
+  });
+
+  app.delete(api.streams.delete.path, requireAuth, async (req, res) => {
+    await storage.deleteStream(Number(req.params.id));
+    res.status(204).send();
+  });
+
+  app.get(api.lines.list.path, requireAuth, async (req, res) => {
+    const lines = await storage.getLines();
+    res.json(lines);
+  });
+
+  app.post(api.lines.create.path, requireAuth, async (req, res) => {
+    const input = api.lines.create.input.parse(req.body);
+    const line = await storage.createLine(input);
+    res.status(201).json(line);
+  });
+
+  app.put(api.lines.update.path, requireAuth, async (req, res) => {
+    const input = api.lines.update.input.parse(req.body);
+    const line = await storage.updateLine(Number(req.params.id), input);
+    res.json(line);
+  });
+
+  app.delete(api.lines.delete.path, requireAuth, async (req, res) => {
+    await storage.deleteLine(Number(req.params.id));
+    res.status(204).send();
+  });
+
+  app.post("/api/streams/import-m3u", requireAuth, async (req, res) => {
+    const { m3uContent, m3uUrl, defaultType } = req.body;
+    let content = m3uContent;
+
+    if (m3uUrl) {
+      try {
+        const response = await fetch(m3uUrl);
+        if (!response.ok) throw new Error(`Failed to fetch M3U: ${response.statusText}`);
+        content = await response.text();
+      } catch (error: any) {
+        return res.status(400).json({ message: `Failed to fetch M3U URL: ${error.message}` });
+      }
+    }
+
+    if (!content) return res.status(400).json({ message: "No M3U content or URL provided" });
+
+    const lines = content.split("\n");
+    let currentStream: any = null;
+    const categories = await storage.getCategories();
+    const categoryMap = new Map(categories.map(c => [c.name.toLowerCase(), c]));
+
+    const imported = [];
+    const existingStreams = await storage.getStreams();
+    const existingUrls = new Set(existingStreams.map(s => s.sourceUrl));
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line.startsWith("#EXTINF:")) {
+        const nameMatch = line.match(/,(.*)$/);
+        const groupMatch = line.match(/group-title="([^"]+)"/);
+        const iconMatch = line.match(/tvg-logo="([^"]+)"/);
+
+        currentStream = {
+          name: nameMatch ? nameMatch[1].trim() : "Unknown",
+          group: groupMatch ? groupMatch[1].trim() : "Uncategorized",
+          icon: iconMatch ? iconMatch[1].trim() : null
+        };
+      } else if (line.startsWith("http") && currentStream) {
+        if (existingUrls.has(line)) {
+          currentStream = null;
+          continue;
+        }
+                const currentGroup = currentStream.group.toLowerCase();
+        let determinedType = defaultType || "live";
+        if (currentGroup.includes("movie") || currentGroup.includes("film")) {
+          determinedType = "movie";
+        } else if (currentGroup.includes("serie") || currentGroup.includes("dizi") || currentGroup.includes("anime") ||
+currentGroup.includes("anime Film")) {
+        determinedType = "serie";
+                } else if (currentGroup.includes("live") || currentGroup.includes("canli") || currentGroup.includes("tv")) {
+          determinedType = "live";
+        }
+        let category = categoryMap.get(currentStream.group.toLowerCase());
+        
+        if (!category) {
+          category = await storage.createCategory({
+            name: currentStream.group,
+            type: determinedType
+          });
+          categoryMap.set(currentStream.group.toLowerCase(), category);
+        }
+
+        const stream = await storage.createStream({
+          name: currentStream.name,
+          categoryId: category.id,
+          sourceUrl: line,
+          streamType: category.type,
+          iconUrl: currentStream.icon,
+          isActive: true
+        });
+        imported.push(stream);
+        currentStream = null;
+      }
+    }
+
+    res.json({ message: `Successfully imported ${imported.length} streams`, count: imported.length });
+  });
+
+  return httpServer;
+}
